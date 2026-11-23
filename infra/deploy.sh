@@ -33,7 +33,9 @@ if [ "${#JWT_SECRET}" -lt 32 ]; then
   echo 'JWT_SECRET must be at least 32 characters.' >&2
   exit 1
 fi
-if [ ! -f "$SOURCE_DIR/package.json" ] || [ ! -f "$SOURCE_DIR/infra/nginx.conf" ]; then
+if [ ! -f "$SOURCE_DIR/package.json" ] \
+  || [ ! -f "$SOURCE_DIR/client/dist/index.html" ] \
+  || [ ! -f "$SOURCE_DIR/infra/nginx.conf" ]; then
   echo "Deployment archive is incomplete: $SOURCE_DIR" >&2
   exit 1
 fi
@@ -48,9 +50,7 @@ printf 'PORT=5000\nNODE_ENV=production\nMONGODB_URI=%s\nJWT_SECRET=%s\n' \
 chown ubuntu:ubuntu "$APP_DIR/server/.env"
 chmod 600 "$APP_DIR/server/.env"
 
-sudo -u ubuntu -H npm ci --prefix "$APP_DIR"
-sudo -u ubuntu -H npm run --prefix "$APP_DIR" build
-sudo -u ubuntu -H npm prune --prefix "$APP_DIR" --omit=dev
+sudo -u ubuntu -H npm ci --omit=dev --prefix "$APP_DIR"
 
 if [ ! -e /etc/nginx/sites-available/expense ]; then
   install -m 0644 "$APP_DIR/infra/nginx.conf" /etc/nginx/sites-available/expense

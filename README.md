@@ -231,7 +231,7 @@ Open your browser at **[http://localhost:5173](http://localhost:5173)**.
 
 ## ☁️ Deploying to AWS
 
-This project deploys the React/Vite frontend and Express API to one Ubuntu EC2 instance, and stores application data in MongoDB Atlas. GitHub Actions transfers the source archive through a private S3 bucket and runs deployment commands through AWS Systems Manager; the instance does not expose SSH. The files are in `infra/`, `server/ecosystem.config.cjs`, and `.github/workflows/deploy.yml`.
+This project deploys the React/Vite frontend and Express API to one Ubuntu EC2 instance, and stores application data in MongoDB Atlas. On each deployment, GitHub Actions tests the backend and builds the frontend, then creates or updates the CloudFormation stack and transfers the build/source archive through a private S3 bucket. The instance is administered through AWS Systems Manager; it does not expose SSH. The files are in `infra/`, `server/ecosystem.config.cjs`, and `.github/workflows/deploy.yml`.
 
 > **HTTPS is required before signing in.** Production auth cookies are `Secure`, so they are not accepted over plain HTTP. Use a domain name and finish Step 7 before registering or logging in.
 
@@ -240,41 +240,44 @@ This project deploys the React/Vite frontend and Express API to one Ubuntu EC2 i
 1. Create a GitHub repository and push this project to its `main` branch. A **private** repository is fine: Actions uploads only committed files to a private S3 bucket.
 2. Confirm `server/.env` is not tracked or committed. It is ignored by `.gitignore`; use GitHub secrets for production values instead.
 
-### 2. Create the AWS infrastructure
+### 2. Configure AWS credentials for GitHub Actions
 
-1. Choose an AWS region and keep it for all AWS resources in this guide.
-2. In the AWS Console, open **CloudFormation → Create stack → With new resources**.
-3. Upload `infra/ec2-instance.yaml`, set the stack name to `expense-tracker-prod`, and keep the default `t3.small` instance type.
-4. Acknowledge the IAM resource creation prompt and create the stack. Wait for `CREATE_COMPLETE`.
-5. Open the stack's **Outputs** tab and note `PublicIP`, `InstanceId`, and `DeploymentBucket`.
-
-The template creates an EC2 instance, a VPC, an Elastic IP, a private artifact bucket, and an instance role. Only web ports 80/443 are open; administration uses Systems Manager. The Elastic IP and EC2 instance are billable, so check current regional pricing and set an AWS budget alert. This setup is not guaranteed to be free-tier eligible.
-
-### 3. Create the MongoDB Atlas database
-
-1. Create an Atlas project and an **M0** cluster, then create a database user with a strong password.
-2. In **Network Access**, add the `PublicIP` from the CloudFormation outputs with `/32` (for example `203.0.113.10/32`). Do not leave `0.0.0.0/0` enabled.
-3. Copy the Atlas driver URI and use a database name such as `expense_tracker`. URL-encode special characters in the database username or password.
-
-### 4. Configure GitHub Actions secrets and variables
-
-In the GitHub repository, open **Settings → Secrets and variables → Actions** and add these repository secrets:
+In the GitHub repository, open **Settings → Secrets and variables → Actions** and add:
 
 | Secret | Value |
 |---|---|
-| `AWS_ACCESS_KEY_ID` | An AWS access key with permissions to read this stack, upload objects to its deployment bucket, write the two SSM parameters, and run/read Systems Manager commands |
+| `AWS_ACCESS_KEY_ID` | AWS access key with permission to deploy this CloudFormation stack and its EC2/VPC/EIP/IAM/S3 resources, pass the instance role, upload to the deployment bucket, write SSM parameters, and run/read SSM commands |
 | `AWS_SECRET_ACCESS_KEY` | Matching AWS secret key |
-| `AWS_SESSION_TOKEN` | Required for temporary credentials such as AWS Academy/Learner Lab; use a repository secret with this name |
+| `AWS_SESSION_TOKEN` | Required for temporary credentials such as AWS Academy/Learner Lab; omit for non-temporary credentials |
+
+Add a repository **variable** named `AWS_REGION` for the region you will use. Never use root-account access keys. Temporary lab credentials expire; update all AWS credential secrets when they are renewed. Some student labs restrict CloudFormation or IAM permissions; if stack creation is denied, use an AWS account/lab that permits those resources.
+
+### 3. Provision the AWS infrastructure
+
+1. Open **Actions → Test and deploy SpendWell → Run workflow**.
+2. Select `provision_only` and run the workflow. It runs the tests/build and creates the `expense-tracker-prod` CloudFormation stack without needing database secrets.
+3. Wait for the run to complete, then note the `PublicIP` shown in the run summary.
+
+The template creates an EC2 instance, VPC, Elastic IP, private deployment bucket, and instance role. Only web ports 80/443 are open; administration uses Systems Manager. The Elastic IP and EC2 instance are billable, so check current regional pricing and set an AWS budget alert. This setup is not guaranteed to be free-tier eligible.
+
+### 4. Create the MongoDB Atlas database
+
+1. Create an Atlas project and an **M0** cluster, then create a database user with a strong password.
+2. In **Network Access**, add the `PublicIP` from the workflow summary with `/32` (for example `203.0.113.10/32`). Do not leave `0.0.0.0/0` enabled.
+3. Copy the Atlas driver URI and use a database name such as `expense_tracker`. URL-encode special characters in the database username or password.
+
+### 5. Add application secrets and deploy
+
+Add these repository secrets:
+
+| Secret | Value |
+|---|---|
 | `MONGODB_URI` | Atlas connection URI for `expense_tracker` |
 | `JWT_SECRET` | A randomly generated secret with at least 32 characters |
 
-Add a repository **variable** named `AWS_REGION` with the region used for the CloudFormation stack. Never use root-account access keys. Temporary lab credentials expire; update all three AWS credential secrets when they are renewed.
+Then run **Actions → Test and deploy SpendWell → Run workflow** with `provision_only` unchecked, or push a commit to `main`. The workflow builds the frontend, updates CloudFormation, stores production secrets as encrypted SSM parameters, uploads the archive to S3, and deploys through SSM.
 
-### 5. Deploy the application
-
-Push a commit to `main`, or open **Actions → Test and deploy SpendWell → Run workflow**. The workflow installs dependencies, runs the server tests, builds the frontend, stores production secrets as encrypted SSM parameters, uploads the committed source to S3, and deploys through SSM.
-
-The first run can take several minutes. Its logs show the instance IP. The workflow fails with a health-check error if the backend cannot connect to Atlas; confirm the Atlas `/32` entry and `MONGODB_URI`, then rerun the workflow.
+The deployment fails with a health-check error if the backend cannot connect to Atlas; confirm the Atlas `/32` entry and `MONGODB_URI`, then rerun the workflow.
 
 ### 6. Point a domain to the instance
 
