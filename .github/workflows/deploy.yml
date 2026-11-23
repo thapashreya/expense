@@ -1,0 +1,160 @@
+name: Test and deploy SpendWell
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test-and-deploy:
+    runs-on: ubuntu-latest
+    env:
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      STACK_NAME: expense-tracker-prod
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install, test, and build
+        run: |
+          npm ci
+          npm test
+          npm run build
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Resolve infrastructure outputs
+        shell: bash
+        run: |
+          if [ -z "$AWS_REGION" ]; then
+            echo 'Set the AWS_REGION repository variable before deploying.' >&2
+            exit 1
+          fi
+
+          STACK_OUTPUTS=$(aws cloudformation describe-stacks \
+            --stack-name "$STACK_NAME" \
+            --query 'Stacks[0].Outputs' \
+            --output json)
+          get_output() {
+            jq -r --arg key "$1" '.[] | select(.OutputKey == $key) | .OutputValue' <<< "$STACK_OUTPUTS"
+          }
+
+          INSTANCE_ID=$(get_output InstanceId)
+          PUBLIC_IP=$(get_output PublicIP)
+          DEPLOYMENT_BUCKET=$(get_output DeploymentBucket)
+          if [ -z "$INSTANCE_ID" ] || [ -z "$PUBLIC_IP" ] || [ -z "$DEPLOYMENT_BUCKET" ]; then
+            echo 'The CloudFormation stack is missing one or more required outputs.' >&2
+            exit 1
+          fi
+
+          echo "INSTANCE_ID=$INSTANCE_ID" >> "$GITHUB_ENV"
+          echo "PUBLIC_IP=$PUBLIC_IP" >> "$GITHUB_ENV"
+          echo "DEPLOYMENT_BUCKET=$DEPLOYMENT_BUCKET" >> "$GITHUB_ENV"
+          echo "Public IP: $PUBLIC_IP"
+          {
+            echo '### SpendWell deployment'
+            echo "- EC2 public IP: \`$PUBLIC_IP\`"
+            echo '- Initial site access is HTTP; configure a domain and TLS before signing in.'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Store production secrets in Parameter Store
+        env:
+          MONGODB_URI: ${{ secrets.MONGODB_URI }}
+          JWT_SECRET: ${{ secrets.JWT_SECRET }}
+        run: |
+          if [ -z "$MONGODB_URI" ] || [ -z "$JWT_SECRET" ]; then
+            echo 'Set the MONGODB_URI and JWT_SECRET repository secrets.' >&2
+            exit 1
+          fi
+          aws ssm put-parameter \
+            --name /expense-tracker/production/MONGODB_URI \
+            --type SecureString \
+            --value "$MONGODB_URI" \
+            --overwrite
+          aws ssm put-parameter \
+            --name /expense-tracker/production/JWT_SECRET \
+            --type SecureString \
+            --value "$JWT_SECRET" \
+            --overwrite
+
+      - name: Upload private deployment archive
+        run: |
+          git archive --format=tar.gz --output=expense-deploy.tar.gz HEAD
+          aws s3 cp expense-deploy.tar.gz \
+            "s3://$DEPLOYMENT_BUCKET/deployments/$GITHUB_SHA.tar.gz"
+
+      - name: Wait for EC2 Systems Manager
+        shell: bash
+        run: |
+          for attempt in $(seq 1 60); do
+            PING_STATUS=$(aws ssm describe-instance-information \
+              --filters "Key=InstanceIds,Values=$INSTANCE_ID" \
+              --query 'InstanceInformationList[0].PingStatus' \
+              --output text 2>/dev/null || true)
+            if [ "$PING_STATUS" = 'Online' ]; then
+              exit 0
+            fi
+            sleep 10
+          done
+          echo "Instance $INSTANCE_ID did not come online in Systems Manager." >&2
+          exit 1
+
+      - name: Deploy through Systems Manager
+        shell: bash
+        run: |
+          COMMAND="sudo cloud-init status --wait && aws s3 cp --region '$AWS_REGION' 's3://$DEPLOYMENT_BUCKET/deployments/$GITHUB_SHA.tar.gz' /tmp/expense-deploy.tar.gz && rm -rf /tmp/expense-deploy && mkdir -p /tmp/expense-deploy && tar -xzf /tmp/expense-deploy.tar.gz -C /tmp/expense-deploy && sudo bash /tmp/expense-deploy/infra/deploy.sh"
+          PARAMETERS=$(jq -cn --arg command "$COMMAND" '{commands: [$command]}')
+          COMMAND_ID=$(aws ssm send-command \
+            --instance-ids "$INSTANCE_ID" \
+            --document-name AWS-RunShellScript \
+            --comment "Deploy SpendWell commit $GITHUB_SHA" \
+            --parameters "$PARAMETERS" \
+            --query 'Command.CommandId' \
+            --output text)
+
+          for attempt in $(seq 1 180); do
+            STATUS=$(aws ssm get-command-invocation \
+              --command-id "$COMMAND_ID" \
+              --instance-id "$INSTANCE_ID" \
+              --query Status \
+              --output text 2>/dev/null || true)
+            case "$STATUS" in
+              Success)
+                aws ssm get-command-invocation \
+                  --command-id "$COMMAND_ID" \
+                  --instance-id "$INSTANCE_ID" \
+                  --query StandardOutputContent \
+                  --output text
+                echo "Deployment succeeded at http://$PUBLIC_IP (add TLS before using authentication)."
+                exit 0
+                ;;
+              Failed|TimedOut|Cancelled|DeliveryTimedOut|ExecutionTimedOut)
+                break
+                ;;
+            esac
+            sleep 10
+          done
+
+          aws ssm get-command-invocation \
+            --command-id "$COMMAND_ID" \
+            --instance-id "$INSTANCE_ID" \
+            --query '{Status:Status,StandardOutput:StandardOutputContent,StandardError:StandardErrorContent}' \
+            --output json || true
+          echo 'Deployment failed or timed out.' >&2
+          exit 1
